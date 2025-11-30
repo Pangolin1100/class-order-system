@@ -5,11 +5,11 @@ import json
 import os
 
 # --- 設定頁面資訊 ---
-st.set_page_config(page_title="班級聚餐取餐系統", page_icon="🍱")
+st.set_page_config(page_title="班級聚餐取餐系統", page_icon="🍱", layout="wide")
 
 # --- 檔案設定 ---
 MENU_FILE = "menu_config.json"
-ORDER_FILE = "orders.csv"  # <--- 新增：這是我們的「共用簽到簿」
+ORDER_FILE = "orders.csv"
 
 # --- 預設菜單 ---
 DEFAULT_CONFIG = {
@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "drinks": ["紅茶", "綠茶", "奶茶", "可樂", "雪碧", "檸檬水"]
 }
 
-# --- 函數：讀取與儲存菜單 ---
+# --- 函數區 ---
 def load_config():
     if os.path.exists(MENU_FILE):
         try:
@@ -36,35 +36,36 @@ def save_config(config):
     with open(MENU_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
-# --- 函數：讀取與儲存訂單 (關鍵修改) ---
 def load_orders():
-    # 如果檔案存在，就讀取它；不存在就回傳空的 DataFrame
     if os.path.exists(ORDER_FILE):
-        return pd.read_csv(ORDER_FILE)
+        # 讀取 CSV
+        df = pd.read_csv(ORDER_FILE)
+        # 為了讓 checkbox 正常運作，確保「領取狀態」欄位是布林值 (True/False)
+        # 如果舊資料是寫 "未領/已領"，這裡會自動修正
+        if '領取狀態' in df.columns:
+            # 將文字轉為 True/False (如果是文字的話)
+            mask = df['領取狀態'].apply(lambda x: isinstance(x, str))
+            df.loc[mask, '領取狀態'] = df.loc[mask, '領取狀態'].replace({"已領": True, "未領": False})
+            # 填補空值為 False
+            df['領取狀態'] = df['領取狀態'].fillna(False).astype(bool)
+        return df
     else:
         return pd.DataFrame(columns=["時間", "座號", "姓名", "主餐", "飲料", "冰塊", "備註", "領取狀態"])
 
-def save_order(new_order_dict):
-    # 讀取舊資料
-    df = load_orders()
-    # 建立新的一筆資料
-    new_row = pd.DataFrame([new_order_dict])
-    # 合併
-    df = pd.concat([df, new_row], ignore_index=True)
-    # 存檔 (index=False 代表不要存 0,1,2 這種行號)
+def save_orders_to_csv(df):
     df.to_csv(ORDER_FILE, index=False, encoding="utf-8-sig")
 
-# 初始化：載入菜單
+# 初始化
 menu_config = load_config()
 
 # ================= 側邊欄：權限控制 =================
 st.sidebar.header("🔐 身份驗證")
 admin_password = st.sidebar.text_input("輸入管理員密碼", type="password")
-ADMIN_KEY = "1234"
+ADMIN_KEY = "1234" # <--- 密碼在這裡
 
 if admin_password == ADMIN_KEY:
-    st.sidebar.success("管理員已登入")
-    page = st.sidebar.radio("選擇功能", ["我要點餐", "📋 查看訂單 (後台)", "⚙️ 修改菜單 (設定)"])
+    st.sidebar.success("管理員模式")
+    page = st.sidebar.radio("功能選單", ["我要點餐", "📋 訂單管理 (後台)", "⚙️ 修改菜單 (設定)"])
 else:
     page = "我要點餐"
 
@@ -90,13 +91,11 @@ if page == "我要點餐":
         with c2:
             ice_choice = st.select_slider("冰塊調整", options=["正常冰", "少冰", "微冰", "去冰", "溫/熱"], value="少冰")
 
-        note = st.text_area("備註 (過敏或特殊需求)", placeholder="無")
-
+        note = st.text_area("備註", placeholder="無")
         submit_button = st.form_submit_button(label='送出訂單')
 
     if submit_button:
         if name and student_id:
-            # 建立訂單資料
             new_order = {
                 "時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "座號": student_id,
@@ -105,70 +104,85 @@ if page == "我要點餐":
                 "飲料": drink_choice,
                 "冰塊": ice_choice,
                 "備註": note,
-                "領取狀態": "未領"
+                "領取狀態": False # 預設為 False (未領)
             }
-            # 儲存到 CSV 檔案
-            save_order(new_order)
+            # 讀取舊的 -> 加上新的 -> 存檔
+            df_current = load_orders()
+            df_new = pd.DataFrame([new_order])
+            df_final = pd.concat([df_current, df_new], ignore_index=True)
+            save_orders_to_csv(df_final)
             
             st.success(f"{name} 同學，你的訂單已送出！")
             st.balloons()
         else:
             st.error("請務必填寫姓名和座號！")
 
-# ================= 頁面 2: 查看訂單 (讀取 CSV) =================
-elif page == "📋 查看訂單 (後台)":
-    st.title("📋 訂單總表")
+# ================= 頁面 2: 訂單管理 (後台) - 這是這次升級的重點！ =================
+elif page == "📋 訂單管理 (後台)":
+    st.title("📋 訂單管理系統")
+    st.write("💡 提示：你可以直接在表格上修改資料，或選取左側方框按 Delete 鍵刪除訂單。")
     
-    # 從 CSV 檔案讀取最新資料
+    # 讀取資料
     df = load_orders()
     
     if not df.empty:
-        # 統計區
-        st.write("### 📊 快速統計")
-        col1, col2 = st.columns(2)
+        # --- 1. 統計區 (新增飲料統計) ---
+        st.write("### 📊 訂單統計")
+        col1, col2, col3 = st.columns(3)
         col1.metric("總訂單數", len(df))
-        if '主餐' in df.columns:
-            col2.write(df['主餐'].value_counts())
+        
+        with col2:
+            st.write("**🍱 主餐統計**")
+            st.dataframe(df['主餐'].value_counts(), height=150)
+            
+        with col3:
+            st.write("**🥤 飲料統計** (新功能)")
+            st.dataframe(df['飲料'].value_counts(), height=150)
         
         st.divider()
 
-        # 搜尋功能
-        search_term = st.text_input("🔍 搜尋姓名或座號", "")
-        if search_term:
-            # 確保欄位是字串型態再搜尋，避免報錯
-            mask = df['姓名'].astype(str).str.contains(search_term) | df['座號'].astype(str).str.contains(search_term)
-            filtered_df = df[mask]
-            st.dataframe(filtered_df, use_container_width=True)
-        else:
-            st.dataframe(df, use_container_width=True)
+        # --- 2. 可編輯的表格 (Magic Table) ---
+        st.write("### 📝 詳細訂單 (可編輯)")
+        
+        # 這裡使用了 st.data_editor 來取代原本的 dataframe
+        edited_df = st.data_editor(
+            df,
+            num_rows="dynamic", # 允許增加或刪除行
+            use_container_width=True,
+            column_config={
+                "領取狀態": st.column_config.CheckboxColumn(
+                    "已領取?",
+                    help="打勾代表已領取",
+                    default=False,
+                ),
+                "時間": st.column_config.TextColumn("下單時間", disabled=True), # 鎖定時間不讓改
+            },
+            hide_index=True, # 隱藏最前面的 0,1,2 數字
+        )
+
+        # --- 3. 自動存檔機制 ---
+        # 如果編輯後的表格跟原本的不一樣，代表有人改過了，立刻存檔
+        if not df.equals(edited_df):
+            save_orders_to_csv(edited_df)
+            st.toast("✅ 資料已自動更新並存檔！", icon="💾") # 跳出一個小通知
             
-        # 下載按鈕 (直接把目前的 CSV 讀出來給下載)
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載訂單 CSV", csv, "class_orders.csv", "text/csv")
+        # 下載按鈕
+        csv = edited_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載 Excel/CSV", csv, "class_orders.csv", "text/csv")
+        
     else:
-        st.warning("目前還沒有人點餐（CSV 檔案是空的）。")
+        st.warning("目前還沒有訂單。")
 
 # ================= 頁面 3: 修改菜單 =================
 elif page == "⚙️ 修改菜單 (設定)":
-    st.title("⚙️ 設定菜單選項")
-    
-    with st.form("menu_edit_form"):
-        st.subheader("🍱 主餐選項 (JSON 格式)")
-        current_meals_text = json.dumps(menu_config['meals'], ensure_ascii=False, indent=4)
-        new_meals_str = st.text_area("編輯主餐", current_meals_text, height=200)
+    st.title("⚙️ 設定菜單")
+    with st.form("menu_edit"):
+        meals_str = json.dumps(menu_config['meals'], ensure_ascii=False, indent=4)
+        new_meals = st.text_area("主餐設定 (JSON)", meals_str, height=200)
         
-        st.subheader("🥤 飲料選項 (逗號分隔)")
-        current_drinks_text = ", ".join(menu_config['drinks'])
-        new_drinks_str = st.text_area("編輯飲料", current_drinks_text)
+        drinks_str = ", ".join(menu_config['drinks'])
+        new_drinks = st.text_area("飲料設定 (用逗號隔開)", drinks_str)
         
-        save_btn = st.form_submit_button("💾 儲存設定")
-
-    if save_btn:
-        try:
-            new_meals = json.loads(new_meals_str)
-            new_drinks = [d.strip() for d in new_drinks_str.replace("，", ",").split(",")]
-            new_config = {"meals": new_meals, "drinks": new_drinks}
-            save_config(new_config)
-            st.success("✅ 菜單已更新！請切換頁面查看。")
-        except Exception as e:
-            st.error(f"❌ 儲存失敗：{e}")
+        if st.form_submit_button("💾 儲存菜單"):
+            try:
+                save_config({"meals": json.
